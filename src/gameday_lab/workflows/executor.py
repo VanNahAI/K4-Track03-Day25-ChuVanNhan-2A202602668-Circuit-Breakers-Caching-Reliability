@@ -28,14 +28,13 @@ T = TypeVar("T")
 
 
 def idempotency_key(req: RefundRequest, step: str) -> str:
-    """TODO(student): a key that is identical for every retry / restart of the same
-    side effect of the same session, and different across sessions and steps."""
-    raise NotImplementedError("TODO(student): idempotency_key()")
+    """Stable key for one side effect of one session. Same on every retry and restart."""
+    return f"{req.session_id}:{step}"
 
 
 def checkpoint_key(req: RefundRequest, step: str) -> str:
-    """TODO(student): DurableStore key under which the result of ``step`` is saved."""
-    raise NotImplementedError("TODO(student): checkpoint_key()")
+    """DurableStore key under which the result of ``step`` is saved."""
+    return f"ckpt:{req.session_id}:{step}"
 
 
 class WorkflowExecutor:
@@ -45,9 +44,15 @@ class WorkflowExecutor:
         self.max_attempts = max_attempts
 
     def _retry(self, fn: Callable[[], T]) -> T:
-        """TODO(student): call fn(); retry on ServiceError / ServiceTimeout up to
-        ``max_attempts`` times (re-raise the last one). Never catch WorkerCrash."""
-        raise NotImplementedError("TODO(student): _retry()")
+        """Call ``fn()``; retry on ServiceError / ServiceTimeout. Never catch WorkerCrash."""
+        last: ServiceError | ServiceTimeout | None = None
+        for _ in range(self.max_attempts):
+            try:
+                return fn()
+            except (ServiceError, ServiceTimeout) as exc:
+                last = exc
+        assert last is not None
+        raise last
 
     def _step(self, req: RefundRequest, state: dict[str, Any], step: str) -> Any:
         """PROVIDED: execute one step. ``state`` holds results of earlier steps."""
@@ -68,11 +73,19 @@ class WorkflowExecutor:
         raise ValueError(step)
 
     def run(self, req: RefundRequest) -> dict[str, Any]:
-        """TODO(student): run every step in STEPS for ``req``.
+        """Run every step in STEPS, skipping steps a previous worker already checkpointed.
 
-        * a step whose checkpoint already exists in ``self.store`` was done by a
-          previous (crashed) worker: load its result into ``state`` and skip it
-        * otherwise execute it with ``self._step`` and checkpoint the result
-        * return {"status": "done", **state}
+        The checkpoint is written only after the step returns, so a crash during
+        the call is resumed by a new worker instead of being treated as done.
         """
-        raise NotImplementedError("TODO(student): run()")
+        state: dict[str, Any] = {}
+        for step in STEPS:
+            key = checkpoint_key(req, step)
+            saved = self.store.get(key)
+            if saved is not None:
+                state[step] = saved
+                continue
+            result = self._step(req, state, step)
+            self.store.put(key, result)
+            state[step] = result
+        return {"status": "done", **state}
